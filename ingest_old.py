@@ -1,15 +1,13 @@
 # ingest.py
-
 import os
 from typing import List, Dict, Any
 
+from config import get_or_create_index
 from embeddings import embed_text
-from local_vector_store import upsert_vectors  # NEW
 
 DOCS_DIR = r"C:\Users\jugal\OneDrive\Documents\Projects\CA\RAG\data"
-CHUNK_SIZE = 600
-CHUNK_OVERLAP = 90
-
+CHUNK_SIZE = 1000       # characters
+CHUNK_OVERLAP = 200     # characters
 
 def load_text_docs(path: str = DOCS_DIR) -> List[Dict[str, Any]]:
     docs = []
@@ -28,7 +26,6 @@ def load_text_docs(path: str = DOCS_DIR) -> List[Dict[str, Any]]:
         )
     return docs
 
-
 def chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[str]:
     chunks = []
     start = 0
@@ -38,9 +35,8 @@ def chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) 
         chunks.append(text[start:end])
         if end == n:
             break
-        start = end - overlap
+        start = end - overlap  # slide with overlap
     return chunks
-
 
 def build_vectors(docs: List[Dict[str, Any]]):
     vectors = []
@@ -62,13 +58,12 @@ def build_vectors(docs: List[Dict[str, Any]]):
             )
     return vectors
 
-
 def ingest():
+    index = get_or_create_index(dimension=768)
     docs = load_text_docs()
     vectors = build_vectors(docs)
-    upsert_vectors(vectors)  # local Chroma instead of Pinecone
-    print(f"Ingested {len(vectors)} chunks into local Chroma DB.")
-
+    index.upsert(vectors=vectors)
+    print(f"Ingested {len(vectors)} chunks into Pinecone index.")
 
 if __name__ == "__main__":
     ingest()

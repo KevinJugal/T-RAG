@@ -1,65 +1,161 @@
-from typing import List, Dict, Any
+# retrieval.py
 
-import ollama
+import re
+from typing import Dict, Any, List, Tuple
 
-from pinecone import Pinecone
-
-from config import PINECONE_API_KEY, PINECONE_INDEX_NAME, EMBED_MODEL, CHAT_MODEL
-
+from local_vector_store import query_vectors
 from embeddings import embed_text
 
-pc = Pinecone(api_key=PINECONE_API_KEY)
+import ollama
+from pinecone import Pinecone
+from config import (
+    CHAT_MODEL,
+    EMBED_MODEL,
+    get_or_create_index,
+)
 
-index = pc.Index(PINECONE_INDEX_NAME)
+CONFIDENCE_THRESHOLD = 0 # similarity threshold for low confidence
 
 
-def search_faqs(query: str, top_k: int = 5) -> List[Dict[str, Any]]:
-    q_emb = embed_text(query)
+def embed_text(text: str) -> List[float]:
+    """
+    Get an embedding from Ollama for the given text.
+    """
+    res = ollama.embeddings(model=EMBED_MODEL, prompt=text)
+    return res["embedding"]
+
+
+'''def retrieve_chunks(query: str, top_k: int = 5) -> Tuple[List[Dict[str, Any]], List[float]]:
+    """
+    Retrieve top_k chunks from Pinecone for the given query and return
+    (matches, scores).
+    """
+    index = get_or_create_index(dimension=768)
+    query_vec = embed_text(query)
+
     res = index.query(
-        vector=q_emb,
+        vector=query_vec,
         top_k=top_k,
-        include_metadata=True
+        include_metadata=True,
+        include_values=False,
     )
 
-    # Pinecone Python client returns dict-like result; normalize to list of matches
-    matches = res.get("matches", [])
-    return matches
-
-
-def build_context(matches: List[Dict[str, Any]]) -> str:
-    parts = []
+    matches = res.get("matches", []) or []
+    # Pinecone Python client typically returns matches as objects; support both dict/object
+    chunks = []
+    scores = []
     for m in matches:
-        md = m["metadata"]
-        txt = md.get("text", "")
-        src = md.get("source", "")
-        parts.append(f"{txt}\n(Source: {src})")
-    return "\n\n---\n\n".join(parts)
+        # m.score and m.metadata on newer clients, or dict-style on older ones
+        score = getattr(m, "score", None) or m.get("score", 0.0)
+        metadata = getattr(m, "metadata", None) or m.get("metadata", {})
+        chunks.append(metadata)
+        scores.append(score)
+
+    return chunks, scores
+'''
+
+def retrieve_chunks(query: str, top_k: int = 3) -> Tuple[List[Dict[str, Any]], List[float]]:
+    """
+    Retrieve top_k chunks from local Chroma for the given query.
+    Returns (chunks_metadata, scores_as_similarities).
+    """
+    query_vec = embed_text(query)
+    metadatas, distances = query_vectors(query_vec, top_k=top_k)
+
+    # Chroma returns distances; convert to pseudo-similarity for your existing logic
+    # Lower distance = more similar; simple transform:
+    scores = [1.0 / (1.0 + d) for d in distances]
+
+    return metadatas, scores
+
+# retrieval.py
+def build_context_from_chunks(chunks):
+    parts = []
+    for i, ch in enumerate(chunks):
+        text = ch.get("text", "")
+        src = ch.get("source", "")
+        parts.append(f"Chunk {i+1} (source: {src}):\n{text}\n")
+    return "\n---\n".join(parts)
 
 
-def answer_billing_question(user_query: str) -> str:
-    matches = search_faqs(user_query, top_k=5)
 
-    # If nothing at all is found, then fall back
-    if not matches:
-        return (
-            "I’m not completely sure about this question. "
-            "Please contact support for more help."
-        )
+def call_llm(question: str, context: str) -> str:
+    """
+    Call Ollama chat model with retrieved context.
+    """
+    max_content_chars = 100000
+    prompt = f"""
+    Answer using only the context. If the answer is not in the context, say you are not sure.
+Answer in 1–2 short sentences.
+Context:
+{context}
 
-    context = build_context(matches)
-    system_prompt = (
-        "You are a helpful assistant that answers questions about voicemail and visual voicemail "
-        "for Telecom customers. Use the context below. "
-        "If the answer is not clearly covered, say you are not sure and suggest contacting support.\n\n"
-        f"Context:\n{context}"
-    )
+Question: {question}
+Answer:"""
 
-    resp = ollama.chat(
+    res = ollama.chat(
         model=CHAT_MODEL,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_query},
-        ],
+        messages=[{"role": "user", "content": prompt}],
+        options={
+            "num_predict":96,
+            "temperature":0.2,},
     )
-    return resp["message"]["content"]
+    # Adjust depending on Ollama's response schema
+    return res["message"]["content"].strip()
 
+
+def answer_billing_question(question: str) -> Dict[str, Any]:
+    """
+    Main entry point used by app.py.
+    Returns dict: {"answer": str or None, "handoff": bool, "reason": str}
+    """
+
+    # 1) Detect explicit user request for human help
+    wants_agent = bool(
+        re.search(
+            r"(human|agent|representative|real person|talk to someone|talk to a person|"
+            r"contact someone|speak to someone|speak to an agent|customer service)",
+            question,
+            re.IGNORECASE,
+        )
+    )
+
+    if wants_agent:
+        return {
+            "answer": "Okay, I’ll connect you to a human assistant.",
+            "handoff": True,
+            "reason": "user_requested",
+        }
+
+    # 2) Normal RAG flow: retrieve chunks from Pinecone
+    chunks, scores = retrieve_chunks(question, top_k=3)
+    best_score = scores[0] if scores else 0.0
+
+    # 3) If low confidence: hand off instead of guessing
+    if best_score < CONFIDENCE_THRESHOLD or not chunks:
+        return {
+            "answer": "I’m not fully sure of the answer from the billing FAQs.",
+            "handoff": True,
+            "reason": "low_confidence",
+            "best_score": best_score,
+        }
+
+    # 4) Build context and ask the LLM
+    context = build_context_from_chunks(chunks)
+    answer = call_llm(question, context)
+
+    # Optional: basic safeguard – if model says it's not sure, escalate
+    if re.search(r"\b(not sure|cannot answer|do not know)\b", answer, re.IGNORECASE):
+        return {
+            "answer": answer,
+            "handoff": True,
+            "reason": "llm_unsure",
+            "best_score": best_score,
+        }
+
+    return {
+        "answer": answer,
+        "handoff": False,
+        "reason": "confident",
+        "best_score": best_score,
+    }
