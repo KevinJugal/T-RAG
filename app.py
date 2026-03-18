@@ -23,9 +23,22 @@ def main():
             break
 
         # Run your RAG billing QA pipeline
-        result = answer_billing_question(q)  # expected: {"answer": str, "handoff": bool, ...}
+        # Expected shape:
+        # {
+        #   "answer": str,
+        #   "handoff": bool,
+        #   "reason": str,
+        #   "best_score": float,
+        #   ...
+        # }
+        result = answer_billing_question(q)
         answer = result.get("answer", "")
         handoff = result.get("handoff", False)
+        reason = result.get("reason", "")
+        best_score = result.get("best_score")
+
+        # Debug line so you can compare behavior with debug_latency.py
+        print(f"[DEBUG] result={result}")
 
         # Show AI answer (may be empty when handing off)
         if answer:
@@ -34,6 +47,8 @@ def main():
         # If handoff is requested, trigger human escalation
         if handoff:
             print("[System] A human assistant will take over this conversation.")
+            if reason:
+                print(f"[System] Handoff reason: {reason} (best_score={best_score})")
             print("[System] Initiating a call to the support number...\n")
 
             try:

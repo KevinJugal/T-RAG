@@ -3,6 +3,9 @@
 import re
 from typing import Dict, Any, List, Tuple
 
+from local_vector_store import query_vectors
+from embeddings import embed_text
+
 import ollama
 from pinecone import Pinecone
 from config import (
@@ -11,7 +14,7 @@ from config import (
     get_or_create_index,
 )
 
-CONFIDENCE_THRESHOLD = 0.30  # similarity threshold for low confidence
+CONFIDENCE_THRESHOLD = 0 # similarity threshold for low confidence
 
 
 def embed_text(text: str) -> List[float]:
@@ -22,7 +25,7 @@ def embed_text(text: str) -> List[float]:
     return res["embedding"]
 
 
-def retrieve_chunks(query: str, top_k: int = 5) -> Tuple[List[Dict[str, Any]], List[float]]:
+'''def retrieve_chunks(query: str, top_k: int = 5) -> Tuple[List[Dict[str, Any]], List[float]]:
     """
     Retrieve top_k chunks from Pinecone for the given query and return
     (matches, scores).
@@ -49,12 +52,24 @@ def retrieve_chunks(query: str, top_k: int = 5) -> Tuple[List[Dict[str, Any]], L
         scores.append(score)
 
     return chunks, scores
+'''
 
+def retrieve_chunks(query: str, top_k: int = 3) -> Tuple[List[Dict[str, Any]], List[float]]:
+    """
+    Retrieve top_k chunks from local Chroma for the given query.
+    Returns (chunks_metadata, scores_as_similarities).
+    """
+    query_vec = embed_text(query)
+    metadatas, distances = query_vectors(query_vec, top_k=top_k)
 
-def build_context_from_chunks(chunks: List[Dict[str, Any]]) -> str:
-    """
-    Concatenate retrieved chunk texts into a single context string.
-    """
+    # Chroma returns distances; convert to pseudo-similarity for your existing logic
+    # Lower distance = more similar; simple transform:
+    scores = [1.0 / (1.0 + d) for d in distances]
+
+    return metadatas, scores
+
+# retrieval.py
+def build_context_from_chunks(chunks):
     parts = []
     for i, ch in enumerate(chunks):
         text = ch.get("text", "")
@@ -63,14 +78,15 @@ def build_context_from_chunks(chunks: List[Dict[str, Any]]) -> str:
     return "\n---\n".join(parts)
 
 
+
 def call_llm(question: str, context: str) -> str:
     """
     Call Ollama chat model with retrieved context.
     """
-    prompt = f"""You are a helpful T-Mobile billing FAQ assistant.
-Use ONLY the provided context to answer the question concisely.
-If the answer is not in the context, say you are not sure.
-
+    max_content_chars = 100000
+    prompt = f"""
+    Answer using only the context. If the answer is not in the context, say you are not sure.
+Answer in 1–2 short sentences.
 Context:
 {context}
 
@@ -80,6 +96,9 @@ Answer:"""
     res = ollama.chat(
         model=CHAT_MODEL,
         messages=[{"role": "user", "content": prompt}],
+        options={
+            "num_predict":96,
+            "temperature":0.2,},
     )
     # Adjust depending on Ollama's response schema
     return res["message"]["content"].strip()
@@ -109,7 +128,7 @@ def answer_billing_question(question: str) -> Dict[str, Any]:
         }
 
     # 2) Normal RAG flow: retrieve chunks from Pinecone
-    chunks, scores = retrieve_chunks(question, top_k=5)
+    chunks, scores = retrieve_chunks(question, top_k=3)
     best_score = scores[0] if scores else 0.0
 
     # 3) If low confidence: hand off instead of guessing
